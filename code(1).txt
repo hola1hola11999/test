@@ -1,0 +1,581 @@
+﻿// BA Portal - Google Apps Script Backend - LIGHTNING FAST v11
+const SHEET_SECURITY = "Security";
+const SHEET_LINKS_RAW = "Links Raw";
+const SHEET_THEMES = "User Themes";
+
+
+let cache = {
+ allFiles: null,
+ frequentFiles: null,
+ categories: null,
+ lastUpdate: 0,
+ filesDates: {} // NEW: cache file dates
+};
+
+
+const CACHE_DURATION = 300;
+const DATES_CACHE_DURATION = 600; // Cache dates for 10 minutes
+
+
+function initializeSheets() {
+ const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let securitySheet = ss.getSheetByName(SHEET_SECURITY);
+ if (!securitySheet) {
+   securitySheet = ss.insertSheet(SHEET_SECURITY);
+   securitySheet.appendRow(["Viewer Emails", "Dev Emails"]);
+ }
+
+
+ let linksRawSheet = ss.getSheetByName(SHEET_LINKS_RAW);
+ if (!linksRawSheet) {
+   linksRawSheet = ss.insertSheet(SHEET_LINKS_RAW);
+   linksRawSheet.appendRow(["File Name", "Link", "Category", "Embedded Web URL", "Frequent Files", "Pinned", "Pin Order", "", "Last Updated"]);
+ }
+
+
+ let themesSheet = ss.getSheetByName(SHEET_THEMES);
+ if (!themesSheet) {
+   themesSheet = ss.insertSheet(SHEET_THEMES);
+   themesSheet.appendRow(["Email", "Theme"]);
+ }
+}
+
+
+function getCurrentUser() {
+ return Session.getActiveUser().getEmail();
+}
+
+
+function getViewerEmails() {
+ const ss = SpreadsheetApp.getActiveSpreadsheet();
+ const sheet = ss.getSheetByName(SHEET_SECURITY);
+ if (!sheet) return [];
+ const data = sheet.getRange("A2:A").getValues();
+ return data.flat().filter(email => email && String(email).trim());
+}
+
+
+function getDevEmails() {
+ const ss = SpreadsheetApp.getActiveSpreadsheet();
+ const sheet = ss.getSheetByName(SHEET_SECURITY);
+ if (!sheet) return [];
+ const data = sheet.getRange("B2:B").getValues();
+ return data.flat().filter(email => email && String(email).trim());
+}
+
+
+function isDevUser() {
+ const userEmail = getCurrentUser();
+ const devEmails = getDevEmails();
+ return devEmails.some(email => String(email).toLowerCase() === userEmail.toLowerCase());
+}
+
+
+function isAuthorizedUser() {
+ const userEmail = getCurrentUser();
+ const viewerEmails = getViewerEmails();
+ const devEmails = getDevEmails();
+ const allAuthorized = [...viewerEmails, ...devEmails];
+ return allAuthorized.some(email => String(email).toLowerCase() === userEmail.toLowerCase());
+}
+
+
+function getFileNameFromLink(sheetLink) {
+ try {
+   if (!sheetLink || sheetLink.trim() === "") return "";
+   const spreadsheet = SpreadsheetApp.openByUrl(sheetLink.trim());
+   return spreadsheet.getName();
+ } catch (e) {
+   return "";
+ }
+}
+
+
+function formatDateForDisplay(dateValue) {
+ try {
+   if (!dateValue || dateValue === "N/A") return "N/A";
+  
+   let date;
+   if (typeof dateValue === 'string') {
+     date = new Date(dateValue);
+   } else if (dateValue instanceof Date) {
+     date = dateValue;
+   } else {
+     return "N/A";
+   }
+  
+   if (isNaN(date.getTime())) return "N/A";
+  
+   const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+   const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  
+   const dayName = days[date.getDay()];
+   const monthName = months[date.getMonth()];
+   const dayNum = String(date.getDate()).padStart(2, '0');
+   const year = date.getFullYear();
+  
+   return `${dayName} ${monthName}-${dayNum}-${year}`;
+ } catch (e) {
+   return "N/A";
+ }
+}
+
+
+function getLastUpdatedDateFast(sheetLink) {
+ try {
+   if (!sheetLink || sheetLink.trim() === "") return "N/A";
+  
+   const spreadsheet = SpreadsheetApp.openByUrl(sheetLink.trim());
+   const sheets = spreadsheet.getSheets();
+   let maxDate = null;
+
+
+   for (let sheet of sheets) {
+     const sheetName = sheet.getName().toLowerCase();
+     if (sheetName.includes("raw")) {
+       const result = extractMaxDateFromSheet(sheet);
+       if (result) {
+         maxDate = result;
+         break;
+       }
+     }
+   }
+
+
+   if (!maxDate) {
+     for (let sheet of sheets) {
+       const result = extractMaxDateFromSheet(sheet);
+       if (result) {
+         maxDate = result;
+         break;
+       }
+     }
+   }
+
+
+   if (maxDate) {
+     return formatDateForDisplay(maxDate);
+   }
+   return "N/A";
+ } catch (e) {
+   return "N/A";
+ }
+}
+
+
+function extractMaxDateFromSheet(sheet) {
+ try {
+   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+   const lastRowNum = sheet.getLastRow();
+  
+   if (lastRowNum <= 1) return null;
+
+
+   for (let i = 0; i < headers.length; i++) {
+     const headerLower = String(headers[i]).toLowerCase();
+    
+     if (headerLower.includes("date") || headerLower.includes("updated") || headerLower.includes("modified")) {
+       try {
+         const dateRange = sheet.getRange(2, i + 1, lastRowNum - 1, 1).getValues();
+         let maxDate = null;
+
+
+         for (let row of dateRange) {
+           if (row[0]) {
+             const dateStr = String(row[0]).trim();
+             const date = new Date(dateStr);
+            
+             if (!isNaN(date.getTime())) {
+               if (!maxDate || date > maxDate) {
+                 maxDate = date;
+               }
+             }
+           }
+         }
+
+
+         if (maxDate) {
+           return maxDate;
+         }
+       } catch (e) {
+         continue;
+       }
+     }
+   }
+  
+   return null;
+ } catch (e) {
+   return null;
+ }
+}
+
+
+function getAllFilesOptimized() {
+ const now = new Date().getTime();
+ if (cache.allFiles && (now - cache.lastUpdate) < CACHE_DURATION) {
+   return cache.allFiles;
+ }
+
+
+ const ss = SpreadsheetApp.getActiveSpreadsheet();
+ const sheet = ss.getSheetByName(SHEET_LINKS_RAW);
+ if (!sheet) return [];
+
+
+ const lastRow = sheet.getLastRow();
+ if (lastRow <= 1) return [];
+
+
+ // FAST: Get data without fetching dates
+ const data = sheet.getRange("A2:I" + lastRow).getValues();
+ const files = [];
+
+
+ data.forEach((row, index) => {
+   if (row[0] && row[1]) {
+     let liveFileName = "";
+     try {
+       liveFileName = getFileNameFromLink(String(row[1]).trim());
+       if (!liveFileName || !liveFileName.trim()) {
+         liveFileName = String(row[0]).trim();
+       }
+     } catch (e) {
+       liveFileName = String(row[0]).trim();
+     }
+
+
+     // Get cached date if available, otherwise use placeholder
+     const link = String(row[1]).trim();
+     let lastUpdated = "Loading...";
+     if (cache.filesDates && cache.filesDates[link]) {
+       lastUpdated = cache.filesDates[link];
+     }
+
+
+     files.push({
+       id: index,
+       name: liveFileName,
+       link: link,
+       category: row[2] ? String(row[2]).trim() : "Uncategorized",
+       embeddedURL: row[3] ? String(row[3]).trim() : "",
+       frequent: row[4] ? String(row[4]).toLowerCase() === "true" : false,
+       pinned: row[5] ? String(row[5]).toLowerCase() === "true" : false,
+       pinOrder: row[6] ? parseInt(row[6]) : 0,
+       lastUpdated: lastUpdated
+     });
+   }
+ });
+
+
+ cache.allFiles = files;
+ cache.lastUpdate = now;
+
+
+ return files;
+}
+
+
+// NEW: Get dates in background (async) - with timeout protection
+function getFilesDatesAsync(fileLinks) {
+ try {
+   const dates = {};
+   const now = new Date().getTime();
+  
+   // Check if we have cached dates
+   if (cache.filesDates && cache.datesCacheTime && (now - cache.datesCacheTime) < DATES_CACHE_DURATION) {
+     return cache.filesDates;
+   }
+  
+   // Fetch dates for files that don't have cached dates
+   const filesToFetch = fileLinks.filter(link => !cache.filesDates || !cache.filesDates[link]);
+  
+   // IMPORTANT: Add timeout protection to avoid infinite loops
+   let fetchedCount = 0;
+   const maxRetries = fileLinks.length;
+  
+   filesToFetch.slice(0, 20).forEach(link => { // Limit to 20 files per call
+     try {
+       dates[link] = getLastUpdatedDateFast(link);
+       fetchedCount++;
+     } catch (e) {
+       dates[link] = "N/A";
+     }
+   });
+  
+   // Merge with existing cache
+   const result = { ...cache.filesDates, ...dates };
+   cache.filesDates = result;
+   cache.datesCacheTime = now;
+  
+   return result;
+ } catch (e) {
+   Logger.log("Error in getFilesDatesAsync: " + e.toString());
+   return cache.filesDates || {};
+ }
+}
+
+
+function getFrequentFilesOptimized() {
+ const allFiles = getAllFilesOptimized();
+ return allFiles.filter(f => f.frequent === true).sort((a, b) => {
+   if (a.pinned && !b.pinned) return -1;
+   if (!a.pinned && b.pinned) return 1;
+   if (a.pinned && b.pinned) return a.pinOrder - b.pinOrder;
+   return 0;
+ });
+}
+
+
+function getCategoriesOptimized(files) {
+ const categories = new Set();
+ files.forEach(file => {
+   if (file.category) categories.add(file.category);
+ });
+ return Array.from(categories).sort();
+}
+
+
+function addFileToRaw(name, link, category, embeddedURL, frequent) {
+ try {
+   const ss = SpreadsheetApp.getActiveSpreadsheet();
+   let sheet = ss.getSheetByName(SHEET_LINKS_RAW);
+
+
+   if (!sheet) {
+     sheet = ss.insertSheet(SHEET_LINKS_RAW);
+     sheet.appendRow(["File Name", "Link", "Category", "Embedded Web URL", "Frequent Files", "Pinned", "Pin Order", "", "Last Updated"]);
+   }
+
+
+   let liveFileName = getFileNameFromLink(link);
+   if (!liveFileName || !liveFileName.trim()) {
+     liveFileName = name;
+   }
+
+
+   const lastUpdated = getLastUpdatedDateFast(link);
+
+
+   sheet.appendRow([liveFileName, link, category, embeddedURL, frequent ? "true" : "false", "false", 0, "", lastUpdated]);
+   clearCache();
+
+
+   return { success: true, message: "File added successfully" };
+ } catch (e) {
+   return { success: false, message: e.toString() };
+ }
+}
+
+
+function updateFile(fileId, name, link, category, embeddedURL, frequent) {
+ try {
+   const ss = SpreadsheetApp.getActiveSpreadsheet();
+   const sheet = ss.getSheetByName(SHEET_LINKS_RAW);
+
+
+   if (!sheet) return { success: false, message: "Sheet not found" };
+
+
+   let liveFileName = getFileNameFromLink(link);
+   if (!liveFileName || !liveFileName.trim()) {
+     liveFileName = name;
+   }
+
+
+   const lastUpdated = getLastUpdatedDateFast(link);
+
+
+   const rowNum = fileId + 2;
+   sheet.getRange(rowNum, 1, 1, 5).setValues([[liveFileName, link, category, embeddedURL, frequent ? "true" : "false"]]);
+   sheet.getRange(rowNum, 9, 1, 1).setValues([[lastUpdated]]);
+
+
+   clearCache();
+
+
+   return { success: true, message: "File updated successfully" };
+ } catch (e) {
+   return { success: false, message: e.toString() };
+ }
+}
+
+
+function deleteFile(fileId) {
+ try {
+   const ss = SpreadsheetApp.getActiveSpreadsheet();
+   const sheet = ss.getSheetByName(SHEET_LINKS_RAW);
+
+
+   if (!sheet) return { success: false, message: "Sheet not found" };
+
+
+   const rowNum = fileId + 2;
+   sheet.deleteRow(rowNum);
+
+
+   clearCache();
+
+
+   return { success: true, message: "File deleted successfully" };
+ } catch (e) {
+   return { success: false, message: e.toString() };
+ }
+}
+
+
+function toggleFrequentFile(fileId, frequent) {
+ try {
+   const ss = SpreadsheetApp.getActiveSpreadsheet();
+   const sheet = ss.getSheetByName(SHEET_LINKS_RAW);
+
+
+   if (!sheet) return { success: false };
+
+
+   const rowNum = fileId + 2;
+   sheet.getRange(rowNum, 5, 1, 1).setValues([[frequent ? "true" : "false"]]);
+
+
+   clearCache();
+
+
+   return { success: true };
+ } catch (e) {
+   return { success: false };
+ }
+}
+
+
+function togglePinFile(fileId, pinned, pinOrder) {
+ try {
+   const ss = SpreadsheetApp.getActiveSpreadsheet();
+   const sheet = ss.getSheetByName(SHEET_LINKS_RAW);
+
+
+   if (!sheet) return { success: false };
+
+
+   const rowNum = fileId + 2;
+   sheet.getRange(rowNum, 6, 1, 2).setValues([[pinned ? "true" : "false", pinOrder]]);
+
+
+   clearCache();
+
+
+   return { success: true };
+ } catch (e) {
+   return { success: false };
+ }
+}
+
+
+function getUserTheme(email) {
+ try {
+   const ss = SpreadsheetApp.getActiveSpreadsheet();
+   const sheet = ss.getSheetByName(SHEET_THEMES);
+
+
+   if (!sheet || sheet.getLastRow() <= 1) return "default";
+
+
+   const data = sheet.getRange("A2:B" + sheet.getLastRow()).getValues();
+
+
+   for (let row of data) {
+     if (String(row[0]).toLowerCase() === email.toLowerCase()) {
+       return String(row[1]).trim();
+     }
+   }
+
+
+   return "default";
+ } catch (e) {
+   return "default";
+ }
+}
+
+
+function saveUserTheme(email, theme) {
+ try {
+   const ss = SpreadsheetApp.getActiveSpreadsheet();
+   let sheet = ss.getSheetByName(SHEET_THEMES);
+
+
+   if (!sheet) {
+     sheet = ss.insertSheet(SHEET_THEMES);
+     sheet.appendRow(["Email", "Theme"]);
+   }
+
+
+   const lastRow = sheet.getLastRow();
+   const data = lastRow > 1 ? sheet.getRange("A2:A" + lastRow).getValues() : [];
+
+
+   let found = false;
+   for (let i = 0; i < data.length; i++) {
+     if (String(data[i][0]).toLowerCase() === email.toLowerCase()) {
+       sheet.getRange(i + 2, 2, 1, 1).setValue(theme);
+       found = true;
+       break;
+     }
+   }
+
+
+   if (!found) {
+     sheet.appendRow([email, theme]);
+   }
+
+
+   return { success: true };
+ } catch (e) {
+   return { success: false };
+ }
+}
+
+
+function clearCache() {
+ cache.allFiles = null;
+ cache.frequentFiles = null;
+ cache.categories = null;
+ cache.lastUpdate = 0;
+ // DON'T clear filesDates cache - keep it for reuse
+}
+
+
+function getPortalDataOptimized() {
+ if (!isAuthorizedUser()) {
+   return {
+     authorized: false,
+     userEmail: getCurrentUser()
+   };
+ }
+
+
+ const userEmail = getCurrentUser();
+ const isDev = isDevUser();
+
+
+ const allFiles = getAllFilesOptimized();
+ const frequentFiles = getFrequentFilesOptimized();
+ const categories = getCategoriesOptimized(allFiles);
+ const theme = getUserTheme(userEmail);
+
+
+ return {
+   authorized: true,
+   userEmail: userEmail,
+   isDev: isDev,
+   allFiles: allFiles,
+   frequentFiles: frequentFiles,
+   categories: categories,
+   theme: theme
+ };
+}
+
+
+function doGet() {
+ initializeSheets();
+  return HtmlService.createHtmlOutputFromFile('index')
+   .setTitle("🌀 BA Portal")
+   .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
